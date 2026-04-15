@@ -1,0 +1,523 @@
+"""
+dino_change_detector.py — DINOv3-Large Satellite Change Detection System
+=========================================================================
+
+Production-grade change detection on panchromatic (grayscale) satellite imagery
+using multi-scale DINOv3-Large patch descriptors with strict 6GB VRAM safeguards.
+
+Module 1: Radiometric Preprocessing Pipeline
+  - dtype routing (uint8 / uint16)
+  - robust min-max scaling for HDR (uint16) inputs
+  - CLAHE local contrast enhancement
+  - grayscale-to-RGB broadcast
+  - bilateral filtering
+  - ImageNet normalisation
+
+Subsequent modules (2–5) will add model loading, feature extraction,
+change logic, and visualisation.
+
+Author : CV Engineering
+Python : 3.12+
+"""
+
+from __future__ import annotations  # not required in 3.12, but harmless — retained for IDE compat
+
+import logging
+from dataclasses import dataclass
+from typing import Final
+
+import cv2
+import numpy as np
+import torch
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  MODULE-LEVEL CONSTANTS  (Section 0.3)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+LAYER_INDICES: Final[tuple[int, int, int]] = (8, 16, 24)
+# PHYSICAL REASON: Layer 8 = edges/texture, Layer 16 = structural parts,
+# Layer 24 = semantic identity. Concatenation captures all three scales.
+
+IMAGENET_MEAN: Final[list[float]] = [0.485, 0.456, 0.406]
+IMAGENET_STD: Final[list[float]] = [0.229, 0.224, 0.225]
+# PHYSICAL REASON: DINOv3-L pretrained on ImageNet RGB statistics. Weight
+# initialisation and layer-norm calibrated to these exact values.
+
+PATCH_SIZE_PX: Final[int] = 14
+# PHYSICAL REASON: DINOv3-L uses 14×14 pixel patches for tokenisation.
+
+CONSENSUS_KERNEL: Final[int] = 3
+# PHYSICAL REASON: 3×3 max-pool on similarity suppresses ±1-patch displacement
+# from orthorectification residuals and relief-induced parallax.
+
+BORDER_EXCLUSION_PX: Final[int] = 3
+# PHYSICAL REASON: Outermost 3 patch rows/columns contain projection distortion
+# and bicubic resampling ghosts from orthorectification.
+
+MODEL_INPUT_SIZE: Final[int] = 448
+# PHYSICAL REASON: 448 / 14 = 32 patches per side → 1024 patch tokens,
+# the standard DINOv3-L input resolution.
+
+ROBUST_PERCENTILE_LOW: Final[float] = 1.0
+ROBUST_PERCENTILE_HIGH: Final[float] = 99.0
+# PHYSICAL REASON: Clips top/bottom 1% of histogram. Specular reflections
+# (metal roofs, wet tarmac) can push DN to 60k+ against a scene mean of ~8k.
+# Without clipping, structural features compress into bottom 13% of uint8 range.
+
+RADIOMETRIC_DRIFT_THRESHOLD: Final[float] = 0.30
+# PHYSICAL REASON: >30% relative difference in scene-mean luminance between
+# T1 and T2 indicates significant solar elevation, haze, or seasonal albedo
+# shift. Z-score thresholding compensates, but the operator should be alerted.
+
+BILATERAL_D: Final[int] = 9
+# PHYSICAL REASON: 9px diameter kernel for bilateral filter — covers roughly
+# 0.64 of a DINOv3 patch, sufficient for speckle suppression without
+# blurring inter-patch structural boundaries.
+
+FLOAT_EPS: Final[float] = 1e-6
+# PHYSICAL REASON: Guards against division by zero in uniform-DN images
+# (clouds, deep water) where p_low == p_high.
+
+Z_SCORE_EPS: Final[float] = 1e-8
+# PHYSICAL REASON: Guards z-score denominator when change_map has near-zero
+# variance (e.g., two identical images produce a flat similarity surface).
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CUSTOM EXCEPTIONS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class ConfigurationError(Exception):
+    """Raised when model output geometry violates expected constraints."""
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CHANGE RESULT DATACLASS  (Section 0.4)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@dataclass
+class ChangeResult:
+    """Structured output from DinoV3ChangeDetector.compare().
+
+    All spatial arrays share the same pooled patch-grid resolution (H_p, W_p)
+    with BORDER_EXCLUSION_PX zeroed on all four edges.
+
+    Attributes:
+        change_map:      float32 (H_p, W_p) — pooled, border-zeroed change intensity.
+        binary_mask:     bool    (H_p, W_p) — z-score thresholded change mask.
+        z_map:           float32 (H_p, W_p) — pre-threshold z-scores (preserved for
+                         downstream re-thresholding at alternative sigma values).
+        change_ratio:    Fraction of True patches in binary_mask after border exclusion.
+        mean_similarity: Global mean of the raw (pre-pool) cosine similarity map.
+        vram_peak_gb:    Peak GPU memory recorded across both forward passes.
+    """
+
+    change_map: np.ndarray       # float32 (H_p, W_p)
+    binary_mask: np.ndarray      # bool    (H_p, W_p)
+    z_map: np.ndarray            # float32 (H_p, W_p)
+    change_ratio: float          # [0.0, 1.0]
+    mean_similarity: float       # typically [0.5, 1.0]
+    vram_peak_gb: float          # >= 0.0
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  MAIN DETECTOR CLASS — MODULE 1 (Preprocessing)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class DinoV3ChangeDetector:
+    """DINOv3-Large change detector for panchromatic satellite imagery.
+
+    Processes two temporally separated images through a radiometric
+    preprocessing pipeline, extracts multi-scale DINOv3 patch descriptors,
+    and computes patch-level change maps via cosine similarity with
+    neighbourhood consensus pooling and z-score thresholding.
+
+    This class enforces strict sequential GPU usage to operate within a
+    6GB VRAM budget.
+
+    Args:
+        model_path:      Path to a local DINOv3-Large checkpoint directory.
+        device:          Target device ('cuda' or 'cpu').
+        clahe_clip:      CLAHE clipLimit controlling local contrast amplification.
+        clahe_tile:      CLAHE tile grid size (tiles per axis).
+        sigma_color:     Bilateral filter colour sigma (DN units).
+        sigma_space:     Bilateral filter spatial sigma (pixel units).
+        threshold_sigma: Z-score threshold for binary change mask.
+        target_size:     Model input resolution in pixels (default 448).
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        device: str = "cuda",
+        clahe_clip: float = 2.0,
+        clahe_tile: int = 8,
+        sigma_color: float = 75.0,
+        sigma_space: float = 75.0,
+        threshold_sigma: float = 2.0,
+        target_size: int = MODEL_INPUT_SIZE,
+    ) -> None:
+        self.model_path: str = model_path
+        self.device: str = device
+        self.clahe_clip: float = clahe_clip
+        self.clahe_tile: int = clahe_tile
+        self.sigma_color: float = sigma_color
+        self.sigma_space: float = sigma_space
+        self.threshold_sigma: float = threshold_sigma
+        self.target_size: int = target_size
+
+        # CLAHE operator — reusable, stateless
+        self._clahe: cv2.CLAHE = cv2.createCLAHE(
+            clipLimit=self.clahe_clip,
+            tileGridSize=(self.clahe_tile, self.clahe_tile),
+        )
+
+        # Model will be loaded in Module 2
+        self._model: object | None = None
+
+        logger.info(
+            "DinoV3ChangeDetector initialised — device=%s, target=%dpx, "
+            "clahe_clip=%.1f, clahe_tile=%d, sigma_color=%.0f, "
+            "sigma_space=%.0f, threshold_sigma=%.1f",
+            self.device,
+            self.target_size,
+            self.clahe_clip,
+            self.clahe_tile,
+            self.sigma_color,
+            self.sigma_space,
+            self.threshold_sigma,
+        )
+
+    # ── Input Coercion ──────────────────────────────────────────────
+
+    @staticmethod
+    def _ensure_grayscale(img: np.ndarray) -> np.ndarray:
+        """Convert input to 2D grayscale array, preserving dtype.
+
+        Handles:
+          - (H, W)     → pass through
+          - (H, W, 1)  → squeeze channel axis
+          - (H, W, 3)  → luminance conversion (uint8 only)
+
+        Args:
+            img: Input image array.
+
+        Returns:
+            2D grayscale array with same dtype as input.
+
+        Raises:
+            ValueError: If array has unsupported shape.
+        """
+        if img.ndim == 2:
+            return img
+
+        if img.ndim == 3 and img.shape[2] == 1:
+            return img[:, :, 0]
+
+        if img.ndim == 3 and img.shape[2] == 3:
+            if img.dtype != np.uint8:
+                raise TypeError(
+                    f"RGB input must be uint8, got {img.dtype}. "
+                    "Multi-channel uint16 imagery is not supported."
+                )
+            # PHYSICAL REASON: cv2.COLOR_RGB2GRAY uses BT.601 luminance weights
+            # (0.299R + 0.587G + 0.114B), appropriate for converting visible-band
+            # RGB composites to a single panchromatic-equivalent channel.
+            return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+        raise ValueError(
+            f"Unsupported image shape {img.shape}. "
+            "Expected (H,W), (H,W,1), or (H,W,3)."
+        )
+
+    # ── Robust uint16 → uint8 Scaling (Section 1.2) ─────────────────
+
+    @staticmethod
+    def _robust_scale_uint16(arr: np.ndarray) -> np.ndarray:
+        """Apply per-image robust min-max scaling from uint16 to uint8.
+
+        Uses 1st/99th percentile bounds to clip histogram extremes before
+        linear rescaling. The per-image computation ensures that each
+        acquisition's unique radiometric range is independently normalised,
+        correctly handling cases where one scene is significantly darker
+        or brighter than the other.
+
+        Args:
+            arr: 2D uint16 grayscale array.
+
+        Returns:
+            2D uint8 array with full dynamic range utilisation.
+        """
+        # Step A — Compute robust histogram bounds (per-image)
+        p_low: float = float(np.percentile(arr, ROBUST_PERCENTILE_LOW))
+        p_high: float = float(np.percentile(arr, ROBUST_PERCENTILE_HIGH))
+        # PHYSICAL REASON: 1%/99% clipping removes specular reflections and
+        # sensor noise floor, ensuring 98% of scene content spans 0–255.
+
+        logger.debug(
+            "uint16 robust scaling: p1=%.1f, p99=%.1f, range=%.1f DN",
+            p_low, p_high, p_high - p_low,
+        )
+
+        # Step B — Clip and rescale
+        arr_clipped: np.ndarray = np.clip(arr, p_low, p_high)
+        arr_uint8: np.ndarray = (
+            (arr_clipped - p_low) / (p_high - p_low + FLOAT_EPS) * 255.0
+            # PHYSICAL REASON: +1e-6 guards against division by zero when
+            # p_low == p_high (uniform-DN images: clouds, deep water).
+        ).astype(np.uint8)
+
+        return arr_uint8
+
+    # ── Radiometric Drift Check ──────────────────────────────────────
+
+    @staticmethod
+    def check_radiometric_drift(
+        img1_uint8: np.ndarray,
+        img2_uint8: np.ndarray,
+    ) -> float:
+        """Compute relative mean-luminance drift between two uint8 images.
+
+        Logs a WARNING if the drift exceeds RADIOMETRIC_DRIFT_THRESHOLD (30%).
+        This indicates significant solar elevation, haze, or seasonal albedo
+        differences between acquisitions. The z-score threshold compensates
+        statistically, but the operator should be aware.
+
+        Args:
+            img1_uint8: T1 image after CLAHE, uint8.
+            img2_uint8: T2 image after CLAHE, uint8.
+
+        Returns:
+            Relative drift as a float in [0.0, 1.0+].
+        """
+        mean_t1: float = float(np.mean(img1_uint8))
+        mean_t2: float = float(np.mean(img2_uint8))
+        max_mean: float = max(mean_t1, mean_t2)
+
+        drift: float = abs(mean_t1 - mean_t2) / (max_mean + FLOAT_EPS)
+
+        if drift > RADIOMETRIC_DRIFT_THRESHOLD:
+            logger.warning(
+                "RADIOMETRIC DRIFT DETECTED: %.1f%% relative difference in "
+                "scene-mean luminance (T1=%.1f, T2=%.1f). Z-score thresholding "
+                "compensates, but expect a wider change-map spread. Consider "
+                "verifying acquisition metadata (solar elevation, haze index).",
+                drift * 100.0,
+                mean_t1,
+                mean_t2,
+            )
+        else:
+            logger.debug(
+                "Radiometric drift check passed: %.1f%% (T1=%.1f, T2=%.1f)",
+                drift * 100.0,
+                mean_t1,
+                mean_t2,
+            )
+
+        return drift
+
+    # ── Core Preprocessing Pipeline (Sections 1.1–1.6) ──────────────
+
+    def preprocess(self, img: np.ndarray) -> torch.Tensor:
+        """Full radiometric preprocessing: raw sensor image → model-ready tensor.
+
+        Pipeline:
+          1. Shape coercion → 2D grayscale
+          2. Dtype routing (uint8 direct, uint16 via robust scaling)
+          3. CLAHE local contrast enhancement
+          4. Grayscale → RGB broadcast
+          5. Bilateral filter (edge-preserving noise suppression)
+          6. Resize to model input resolution
+          7. ImageNet normalisation
+          8. Tensor conversion → (1, 3, H, W) float32
+
+        Args:
+            img: Input image as numpy array.
+                 Supported: uint8 or uint16, shapes (H,W), (H,W,1), (H,W,3).
+
+        Returns:
+            Float32 tensor of shape (1, 3, target_size, target_size) on CPU,
+            normalised with ImageNet mean/std.
+
+        Raises:
+            TypeError:  If input dtype is not uint8 or uint16.
+            ValueError: If input shape is not 2D or 3D with 1 or 3 channels.
+        """
+        # ── Step 0: Shape coercion ──
+        gray: np.ndarray = self._ensure_grayscale(img)
+
+        # ── Step 1.1: Dtype detection and routing ──
+        if gray.dtype == np.uint8:
+            img_uint8: np.ndarray = gray
+            logger.debug("Input dtype: uint8 — proceeding to CLAHE directly.")
+
+        elif gray.dtype == np.uint16:
+            logger.debug("Input dtype: uint16 — applying robust scaling.")
+            img_uint8 = self._robust_scale_uint16(gray)
+            # PHYSICAL REASON: uint16 carries 11–16 bit radiometric depth.
+            # Direct cast to uint8 would discard the upper byte, losing all
+            # structural information above DN 255.
+
+        else:
+            raise TypeError(
+                f"Unsupported input dtype {gray.dtype}. "
+                "Expected uint8 or uint16 panchromatic imagery."
+            )
+
+        # ── Step 1.3: CLAHE — local contrast enhancement ──
+        img_clahe: np.ndarray = self._clahe.apply(img_uint8)
+        # PHYSICAL REASON: clipLimit=2.0 prevents over-amplification of sensor
+        # noise in radiometrically flat regions (water, cloud shadow, bare soil).
+        # tileGridSize=(8,8) at 448px → 56px tiles ≈ 4 DINOv3 patches, ensuring
+        # CLAHE operates at inter-patch scale.
+
+        # ── Step 1.4: Grayscale → RGB broadcast ──
+        img_rgb: np.ndarray = np.stack(
+            [img_clahe, img_clahe, img_clahe], axis=-1
+        )
+        # PHYSICAL REASON: Identical channels neutralise DINOv3 attention heads
+        # that specialise on chromatic variation. Luminance and structural
+        # gradient heads carry the full descriptive load for panchromatic input.
+
+        # ── Step 1.5: Bilateral filter ──
+        img_filtered: np.ndarray = cv2.bilateralFilter(
+            img_rgb,
+            d=BILATERAL_D,
+            # PHYSICAL REASON: 9px kernel ≈ 0.64 of a DINOv3 patch.
+            sigmaColor=self.sigma_color,
+            # PHYSICAL REASON: Preserves edges with DN contrast > 75, protecting
+            # aircraft boundaries and infrastructure outlines.
+            sigmaSpace=self.sigma_space,
+            # PHYSICAL REASON: Spatial sigma matches colour sigma for isotropic
+            # smoothing within homogeneous regions.
+        )
+
+        # ── Step: Resize to model input resolution ──
+        h, w = img_filtered.shape[:2]
+        if h != self.target_size or w != self.target_size:
+            img_filtered = cv2.resize(
+                img_filtered,
+                (self.target_size, self.target_size),
+                interpolation=cv2.INTER_LINEAR,
+                # PHYSICAL REASON: Bilinear interpolation avoids ringing
+                # artifacts at strong edges that bicubic can introduce.
+            )
+            logger.debug(
+                "Resized from (%d, %d) to (%d, %d).",
+                h, w, self.target_size, self.target_size,
+            )
+
+        # ── Step 1.6: ImageNet normalisation ──
+        img_float: np.ndarray = img_filtered.astype(np.float32) / 255.0
+        # PHYSICAL REASON: Scale to [0, 1] before applying channel-wise
+        # normalisation to match ImageNet training distribution.
+
+        for c in range(3):  # PHYSICAL REASON: per-channel norm required even
+            #                  for identical channels — model weights are
+            #                  calibrated per-channel.
+            img_float[:, :, c] = (
+                (img_float[:, :, c] - IMAGENET_MEAN[c]) / IMAGENET_STD[c]
+            )
+
+        # ── Step: Convert to tensor (1, 3, H, W) ──
+        # HWC → CHW → NCHW
+        tensor: torch.Tensor = torch.from_numpy(
+            img_float.transpose(2, 0, 1)  # (3, H, W)
+        ).unsqueeze(0)  # (1, 3, H, W)
+
+        logger.debug(
+            "Preprocessed tensor: shape=%s, dtype=%s, "
+            "min=%.3f, max=%.3f, mean=%.3f",
+            tuple(tensor.shape),
+            tensor.dtype,
+            tensor.min().item(),
+            tensor.max().item(),
+            tensor.mean().item(),
+        )
+
+        return tensor
+
+    # ── Spatial Alignment (used by compare() in Module 4) ────────────
+
+    @staticmethod
+    def _align_spatial(
+        img1: np.ndarray,
+        img2: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Resize img2 to match img1 spatial dimensions if they differ.
+
+        Args:
+            img1: Reference image (T1).
+            img2: Target image (T2), will be resized if dimensions differ.
+
+        Returns:
+            Tuple of (img1_unchanged, img2_possibly_resized).
+        """
+        h1, w1 = img1.shape[:2]
+        h2, w2 = img2.shape[:2]
+
+        if h1 != h2 or w1 != w2:
+            logger.warning(
+                "Spatial dimension mismatch: T1=(%d,%d), T2=(%d,%d). "
+                "Resizing T2 to match T1.",
+                h1, w1, h2, w2,
+            )
+            img2 = cv2.resize(
+                img2, (w1, h1),
+                interpolation=cv2.INTER_LINEAR,
+            )
+
+        return img1, img2
+
+    # ── Stub methods for Modules 2–5 (to be implemented) ─────────────
+
+    def compare(self, img1: np.ndarray, img2: np.ndarray) -> ChangeResult:
+        """Compare two temporal images and return change detection results.
+
+        [Module 4 — not yet implemented]
+
+        Args:
+            img1: T1 image (reference).
+            img2: T2 image (target).
+
+        Returns:
+            ChangeResult dataclass with all detection outputs.
+
+        Raises:
+            NotImplementedError: Until Module 4 is integrated.
+        """
+        raise NotImplementedError(
+            "compare() requires Modules 2–4 (model loading, feature extraction, "
+            "change logic). Proceed to Module 2 implementation."
+        )
+
+    def visualize(
+        self,
+        img1: np.ndarray,
+        img2: np.ndarray,
+        result: ChangeResult,
+        t1_label: str = "T1",
+        t2_label: str = "T2",
+    ) -> np.ndarray:
+        """Produce three-panel visualisation of change detection results.
+
+        [Module 5 — not yet implemented]
+
+        Args:
+            img1:     T1 image.
+            img2:     T2 image.
+            result:   ChangeResult from compare().
+            t1_label: Label for T1 panel.
+            t2_label: Label for T2 panel.
+
+        Returns:
+            uint8 RGB numpy array of the composite visualisation.
+
+        Raises:
+            NotImplementedError: Until Module 5 is integrated.
+        """
+        raise NotImplementedError(
+            "visualize() requires Module 5 implementation."
+        )
