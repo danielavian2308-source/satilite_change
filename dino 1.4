@@ -1,0 +1,1494 @@
+"""
+dino_change_detector.py — DINOv3-Large Satellite Change Detection System
+=========================================================================
+
+Production-grade change detection on panchromatic (grayscale) satellite imagery
+using multi-scale DINOv3-Large patch descriptors with strict 6GB VRAM safeguards.
+
+Module 1: Radiometric Preprocessing Pipeline
+  - dtype routing (uint8 / uint16)
+  - robust min-max scaling for HDR (uint16) inputs
+  - CLAHE local contrast enhancement
+  - grayscale-to-RGB broadcast
+  - bilateral filtering
+  - ImageNet normalisation
+
+Module 2: Model Loading & VRAM-Safe Forward Pass
+  - Lazy DINOv2-Large loading via HuggingFace transformers
+  - Strict sequential GPU→CPU offload protocol (Section 2.2)
+  - Register token stripping with perfect-square grid assertion (Section 3)
+  - Sliding-window tiling for images > 448×448 (6GB VRAM safeguard)
+
+Module 3: Multi-Scale Feature Extraction & Fusion
+  - Per-layer spatial reshape from flat token sequences
+  - Concatenation of layers 8, 16, 24 → 3072-dim descriptor map (Section 4)
+  - Unified _extract_fused_features() pipeline (preprocess → forward → fuse)
+
+Module 4: Change Detection Logic & ChangeResult Assembly
+  - L2-normalised cosine similarity between T1/T2 descriptor maps
+  - 3×3 max-pool on similarity (neighbourhood consensus, Section 5.2)
+  - Dynamic z-score thresholding (Section 5.3)
+  - Border exclusion (Section 5.4)
+  - Fully typed ChangeResult output
+
+Subsequent module (5) will add visualisation.
+
+Author : CV Engineering
+Python : 3.12+
+"""
+
+from __future__ import annotations  # retained for IDE compat
+
+import logging
+import math
+from dataclasses import dataclass
+from typing import Final
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  MODULE-LEVEL CONSTANTS  (Section 0.3)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+LAYER_INDICES: Final[tuple[int, int, int]] = (8, 16, 24)
+# PHYSICAL REASON: Layer 8 = edges/texture, Layer 16 = structural parts,
+# Layer 24 = semantic identity. Concatenation captures all three scales.
+
+IMAGENET_MEAN: Final[list[float]] = [0.485, 0.456, 0.406]
+IMAGENET_STD: Final[list[float]] = [0.229, 0.224, 0.225]
+# PHYSICAL REASON: DINOv3-L pretrained on ImageNet RGB statistics. Weight
+# initialisation and layer-norm calibrated to these exact values.
+
+PATCH_SIZE_PX: Final[int] = 14
+# PHYSICAL REASON: DINOv3-L uses 14×14 pixel patches for tokenisation.
+
+CONSENSUS_KERNEL: Final[int] = 3
+# PHYSICAL REASON: 3×3 max-pool on similarity suppresses ±1-patch displacement
+# from orthorectification residuals and relief-induced parallax.
+
+BORDER_EXCLUSION_PX: Final[int] = 3
+# PHYSICAL REASON: Outermost 3 patch rows/columns contain projection distortion
+# and bicubic resampling ghosts from orthorectification.
+
+MODEL_INPUT_SIZE: Final[int] = 448
+# PHYSICAL REASON: 448 / 14 = 32 patches per side → 1024 patch tokens,
+# the standard DINOv3-L input resolution.
+
+ROBUST_PERCENTILE_LOW: Final[float] = 1.0
+ROBUST_PERCENTILE_HIGH: Final[float] = 99.0
+# PHYSICAL REASON: Clips top/bottom 1% of histogram. Specular reflections
+# (metal roofs, wet tarmac) can push DN to 60k+ against a scene mean of ~8k.
+# Without clipping, structural features compress into bottom 13% of uint8 range.
+
+RADIOMETRIC_DRIFT_THRESHOLD: Final[float] = 0.30
+# PHYSICAL REASON: >30% relative difference in scene-mean luminance between
+# T1 and T2 indicates significant solar elevation, haze, or seasonal albedo
+# shift. Z-score thresholding compensates, but the operator should be alerted.
+
+BILATERAL_D: Final[int] = 9
+# PHYSICAL REASON: 9px diameter kernel for bilateral filter — covers roughly
+# 0.64 of a DINOv3 patch, sufficient for speckle suppression without
+# blurring inter-patch structural boundaries.
+
+FLOAT_EPS: Final[float] = 1e-6
+# PHYSICAL REASON: Guards against division by zero in uniform-DN images
+# (clouds, deep water) where p_low == p_high.
+
+Z_SCORE_EPS: Final[float] = 1e-8
+# PHYSICAL REASON: Guards z-score denominator when change_map has near-zero
+# variance (e.g., two identical images produce a flat similarity surface).
+
+MIN_FREE_VRAM_GB: Final[float] = 1.5
+# PHYSICAL REASON: DINOv3-L forward pass peak allocation ≈ 1.2GB for a
+# single 448×448 tile. 1.5GB provides a 25% safety margin against
+# fragmentation and concurrent CUDA context overhead on 6GB devices.
+
+DINO_HIDDEN_DIM: Final[int] = 1024
+# PHYSICAL REASON: DINOv2-Large (used as DINOv3-L backbone) outputs
+# 1024-dimensional patch descriptors from all transformer layers.
+
+PATCHES_PER_TILE_SIDE: Final[int] = MODEL_INPUT_SIZE // PATCH_SIZE_PX
+# PHYSICAL REASON: 448 / 14 = 32 patches per tile side. Used for spatial
+# reshape of flat patch token sequences.
+
+FUSED_DIM: Final[int] = DINO_HIDDEN_DIM * len(LAYER_INDICES)
+# PHYSICAL REASON: 1024 × 3 layers = 3072. The fused descriptor encodes
+# texture (L8) + structure (L16) + semantics (L24) per patch.
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CUSTOM EXCEPTIONS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class ConfigurationError(Exception):
+    """Raised when model output geometry violates expected constraints."""
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CHANGE RESULT DATACLASS  (Section 0.4)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@dataclass
+class ChangeResult:
+    """Structured output from DinoV3ChangeDetector.compare().
+
+    All spatial arrays share the same pooled patch-grid resolution (H_p, W_p)
+    with BORDER_EXCLUSION_PX zeroed on all four edges.
+
+    Attributes:
+        change_map:      float32 (H_p, W_p) — pooled, border-zeroed change intensity.
+        binary_mask:     bool    (H_p, W_p) — z-score thresholded change mask.
+        z_map:           float32 (H_p, W_p) — pre-threshold z-scores (preserved for
+                         downstream re-thresholding at alternative sigma values).
+        change_ratio:    Fraction of True patches in binary_mask after border exclusion.
+        mean_similarity: Global mean of the raw (pre-pool) cosine similarity map.
+        vram_peak_gb:    Peak GPU memory recorded across both forward passes.
+    """
+
+    change_map: np.ndarray       # float32 (H_p, W_p)
+    binary_mask: np.ndarray      # bool    (H_p, W_p)
+    z_map: np.ndarray            # float32 (H_p, W_p)
+    change_ratio: float          # [0.0, 1.0]
+    mean_similarity: float       # typically [0.5, 1.0]
+    vram_peak_gb: float          # >= 0.0
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  MAIN DETECTOR CLASS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class DinoV3ChangeDetector:
+    """DINOv3-Large change detector for panchromatic satellite imagery.
+
+    Processes two temporally separated images through a radiometric
+    preprocessing pipeline, extracts multi-scale DINOv3 patch descriptors,
+    and computes patch-level change maps via cosine similarity with
+    neighbourhood consensus pooling and z-score thresholding.
+
+    This class enforces strict sequential GPU usage to operate within a
+    6GB VRAM budget. Images larger than 448x448 are automatically tiled
+    using a sliding-window approach with configurable overlap.
+
+    Args:
+        model_path:      Path to a local DINOv3-Large checkpoint directory
+                         or HuggingFace model identifier.
+        device:          Target device ('cuda' or 'cpu').
+        clahe_clip:      CLAHE clipLimit controlling local contrast amplification.
+        clahe_tile:      CLAHE tile grid size (tiles per axis).
+        sigma_color:     Bilateral filter colour sigma (DN units).
+        sigma_space:     Bilateral filter spatial sigma (pixel units).
+        threshold_sigma: Z-score threshold for binary change mask.
+        target_size:     Model input resolution in pixels per tile (default 448).
+        tile_overlap:    Pixel overlap between adjacent tiles (default 0).
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        device: str = "cuda",
+        clahe_clip: float = 2.0,
+        clahe_tile: int = 8,
+        sigma_color: float = 75.0,
+        sigma_space: float = 75.0,
+        threshold_sigma: float = 2.0,
+        target_size: int = MODEL_INPUT_SIZE,
+        tile_overlap: int = 0,
+    ) -> None:
+        self.model_path: str = model_path
+        self.device: str = device
+        self.clahe_clip: float = clahe_clip
+        self.clahe_tile: int = clahe_tile
+        self.sigma_color: float = sigma_color
+        self.sigma_space: float = sigma_space
+        self.threshold_sigma: float = threshold_sigma
+        self.target_size: int = target_size
+        self.tile_overlap: int = tile_overlap
+
+        # CLAHE operator — reusable, stateless
+        self._clahe: cv2.CLAHE = cv2.createCLAHE(
+            clipLimit=self.clahe_clip,
+            tileGridSize=(self.clahe_tile, self.clahe_tile),
+        )
+
+        # Model loaded lazily on first forward pass (Module 2)
+        self._model: torch.nn.Module | None = None
+        self._num_register_tokens: int = 0
+
+        logger.info(
+            "DinoV3ChangeDetector initialised — device=%s, target=%dpx, "
+            "tile_overlap=%dpx, clahe_clip=%.1f, clahe_tile=%d, "
+            "sigma_color=%.0f, sigma_space=%.0f, threshold_sigma=%.1f",
+            self.device,
+            self.target_size,
+            self.tile_overlap,
+            self.clahe_clip,
+            self.clahe_tile,
+            self.sigma_color,
+            self.sigma_space,
+            self.threshold_sigma,
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    #  MODULE 1 — RADIOMETRIC PREPROCESSING PIPELINE
+    # ══════════════════════════════════════════════════════════════════
+
+    # ── Input Coercion ──────────────────────────────────────────────
+
+    @staticmethod
+    def _ensure_grayscale(img: np.ndarray) -> np.ndarray:
+        """Convert input to 2D grayscale array, preserving dtype.
+
+        Handles:
+          - (H, W)     -> pass through
+          - (H, W, 1)  -> squeeze channel axis
+          - (H, W, 3)  -> luminance conversion (uint8 only)
+
+        Args:
+            img: Input image array.
+
+        Returns:
+            2D grayscale array with same dtype as input.
+
+        Raises:
+            ValueError: If array has unsupported shape.
+            TypeError:  If RGB input is not uint8.
+        """
+        if img.ndim == 2:
+            return img
+
+        if img.ndim == 3 and img.shape[2] == 1:
+            return img[:, :, 0]
+
+        if img.ndim == 3 and img.shape[2] == 3:
+            if img.dtype != np.uint8:
+                raise TypeError(
+                    f"RGB input must be uint8, got {img.dtype}. "
+                    "Multi-channel uint16 imagery is not supported."
+                )
+            # PHYSICAL REASON: cv2.COLOR_RGB2GRAY uses BT.601 luminance weights
+            # (0.299R + 0.587G + 0.114B), appropriate for converting visible-band
+            # RGB composites to a single panchromatic-equivalent channel.
+            return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+        raise ValueError(
+            f"Unsupported image shape {img.shape}. "
+            "Expected (H,W), (H,W,1), or (H,W,3)."
+        )
+
+    # ── Robust uint16 -> uint8 Scaling (Section 1.2) ─────────────────
+
+    @staticmethod
+    def _robust_scale_uint16(arr: np.ndarray) -> np.ndarray:
+        """Apply per-image robust min-max scaling from uint16 to uint8.
+
+        Uses 1st/99th percentile bounds to clip histogram extremes before
+        linear rescaling. The per-image computation ensures that each
+        acquisition's unique radiometric range is independently normalised,
+        correctly handling cases where one scene is significantly darker
+        or brighter than the other.
+
+        Args:
+            arr: 2D uint16 grayscale array.
+
+        Returns:
+            2D uint8 array with full dynamic range utilisation.
+        """
+        # Step A — Compute robust histogram bounds (per-image)
+        p_low: float = float(np.percentile(arr, ROBUST_PERCENTILE_LOW))
+        p_high: float = float(np.percentile(arr, ROBUST_PERCENTILE_HIGH))
+        # PHYSICAL REASON: 1%/99% clipping removes specular reflections and
+        # sensor noise floor, ensuring 98% of scene content spans 0–255.
+
+        logger.debug(
+            "uint16 robust scaling: p1=%.1f, p99=%.1f, range=%.1f DN",
+            p_low, p_high, p_high - p_low,
+        )
+
+        # Step B — Clip and rescale
+        arr_clipped: np.ndarray = np.clip(arr, p_low, p_high)
+        arr_uint8: np.ndarray = (
+            (arr_clipped - p_low) / (p_high - p_low + FLOAT_EPS) * 255.0
+            # PHYSICAL REASON: +1e-6 guards against division by zero when
+            # p_low == p_high (uniform-DN images: clouds, deep water).
+        ).astype(np.uint8)
+
+        return arr_uint8
+
+    # ── Radiometric Drift Check ──────────────────────────────────────
+
+    @staticmethod
+    def check_radiometric_drift(
+        img1_uint8: np.ndarray,
+        img2_uint8: np.ndarray,
+    ) -> float:
+        """Compute relative mean-luminance drift between two uint8 images.
+
+        Logs a WARNING if the drift exceeds RADIOMETRIC_DRIFT_THRESHOLD (30%).
+        This indicates significant solar elevation, haze, or seasonal albedo
+        differences between acquisitions.
+
+        Args:
+            img1_uint8: T1 image after CLAHE, uint8.
+            img2_uint8: T2 image after CLAHE, uint8.
+
+        Returns:
+            Relative drift as a float in [0.0, 1.0+].
+        """
+        mean_t1: float = float(np.mean(img1_uint8))
+        mean_t2: float = float(np.mean(img2_uint8))
+        max_mean: float = max(mean_t1, mean_t2)
+
+        drift: float = abs(mean_t1 - mean_t2) / (max_mean + FLOAT_EPS)
+
+        if drift > RADIOMETRIC_DRIFT_THRESHOLD:
+            logger.warning(
+                "RADIOMETRIC DRIFT DETECTED: %.1f%% relative difference in "
+                "scene-mean luminance (T1=%.1f, T2=%.1f). Z-score thresholding "
+                "compensates, but expect a wider change-map spread. Consider "
+                "verifying acquisition metadata (solar elevation, haze index).",
+                drift * 100.0,
+                mean_t1,
+                mean_t2,
+            )
+        else:
+            logger.debug(
+                "Radiometric drift check passed: %.1f%% (T1=%.1f, T2=%.1f)",
+                drift * 100.0,
+                mean_t1,
+                mean_t2,
+            )
+
+        return drift
+
+    # ── Core Preprocessing Pipeline (Sections 1.1–1.6) ──────────────
+
+    def preprocess(self, img: np.ndarray) -> torch.Tensor:
+        """Full radiometric preprocessing: raw sensor image -> model-ready tensor.
+
+        Pipeline:
+          1. Shape coercion -> 2D grayscale
+          2. Dtype routing (uint8 direct, uint16 via robust scaling)
+          3. CLAHE local contrast enhancement
+          4. Grayscale -> RGB broadcast
+          5. Bilateral filter (edge-preserving noise suppression)
+          6. Resize to model input resolution
+          7. ImageNet normalisation
+          8. Tensor conversion -> (1, 3, H, W) float32
+
+        Args:
+            img: Input image as numpy array.
+                 Supported: uint8 or uint16, shapes (H,W), (H,W,1), (H,W,3).
+
+        Returns:
+            Float32 tensor of shape (1, 3, target_size, target_size) on CPU,
+            normalised with ImageNet mean/std.
+
+        Raises:
+            TypeError:  If input dtype is not uint8 or uint16.
+            ValueError: If input shape is not 2D or 3D with 1 or 3 channels.
+        """
+        # ── Step 0: Shape coercion ──
+        gray: np.ndarray = self._ensure_grayscale(img)
+
+        # ── Step 1.1: Dtype detection and routing ──
+        if gray.dtype == np.uint8:
+            img_uint8: np.ndarray = gray
+            logger.debug("Input dtype: uint8 — proceeding to CLAHE directly.")
+
+        elif gray.dtype == np.uint16:
+            logger.debug("Input dtype: uint16 — applying robust scaling.")
+            img_uint8 = self._robust_scale_uint16(gray)
+            # PHYSICAL REASON: uint16 carries 11–16 bit radiometric depth.
+            # Direct cast to uint8 would discard the upper byte, losing all
+            # structural information above DN 255.
+
+        else:
+            raise TypeError(
+                f"Unsupported input dtype {gray.dtype}. "
+                "Expected uint8 or uint16 panchromatic imagery."
+            )
+
+        # ── Step 1.3: CLAHE — local contrast enhancement ──
+        img_clahe: np.ndarray = self._clahe.apply(img_uint8)
+        # PHYSICAL REASON: clipLimit=2.0 prevents over-amplification of sensor
+        # noise in radiometrically flat regions (water, cloud shadow, bare soil).
+        # tileGridSize=(8,8) at 448px -> 56px tiles = 4 DINOv3 patches.
+
+        # ── Step 1.4: Grayscale -> RGB broadcast ──
+        img_rgb: np.ndarray = np.stack(
+            [img_clahe, img_clahe, img_clahe], axis=-1
+        )
+        # PHYSICAL REASON: Identical channels neutralise DINOv3 attention heads
+        # that specialise on chromatic variation.
+
+        # ── Step 1.5: Bilateral filter ──
+        img_filtered: np.ndarray = cv2.bilateralFilter(
+            img_rgb,
+            d=BILATERAL_D,
+            # PHYSICAL REASON: 9px kernel = 0.64 of a DINOv3 patch.
+            sigmaColor=self.sigma_color,
+            # PHYSICAL REASON: Preserves edges with DN contrast > 75.
+            sigmaSpace=self.sigma_space,
+            # PHYSICAL REASON: Spatial sigma matches colour sigma for
+            # isotropic smoothing within homogeneous regions.
+        )
+
+        # ── Step: Resize to model input resolution ──
+        h, w = img_filtered.shape[:2]
+        if h != self.target_size or w != self.target_size:
+            img_filtered = cv2.resize(
+                img_filtered,
+                (self.target_size, self.target_size),
+                interpolation=cv2.INTER_LINEAR,
+                # PHYSICAL REASON: Bilinear avoids ringing at strong edges.
+            )
+            logger.debug(
+                "Resized from (%d, %d) to (%d, %d).",
+                h, w, self.target_size, self.target_size,
+            )
+
+        # ── Step 1.6: ImageNet normalisation ──
+        img_float: np.ndarray = img_filtered.astype(np.float32) / 255.0
+        # PHYSICAL REASON: Scale to [0, 1] before channel-wise normalisation.
+
+        for c in range(3):  # PHYSICAL REASON: per-channel norm required even
+            #                  for identical channels — model weights are
+            #                  calibrated per-channel.
+            img_float[:, :, c] = (
+                (img_float[:, :, c] - IMAGENET_MEAN[c]) / IMAGENET_STD[c]
+            )
+
+        # ── Step: Convert to tensor (1, 3, H, W) ──
+        tensor: torch.Tensor = torch.from_numpy(
+            img_float.transpose(2, 0, 1)  # HWC -> CHW
+        ).unsqueeze(0)  # -> NCHW
+
+        logger.debug(
+            "Preprocessed tensor: shape=%s, dtype=%s, "
+            "min=%.3f, max=%.3f, mean=%.3f",
+            tuple(tensor.shape),
+            tensor.dtype,
+            tensor.min().item(),
+            tensor.max().item(),
+            tensor.mean().item(),
+        )
+
+        return tensor
+
+    # ── Spatial Alignment ────────────────────────────────────────────
+
+    @staticmethod
+    def _align_spatial(
+        img1: np.ndarray,
+        img2: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Resize img2 to match img1 spatial dimensions if they differ.
+
+        Args:
+            img1: Reference image (T1).
+            img2: Target image (T2), will be resized if dimensions differ.
+
+        Returns:
+            Tuple of (img1_unchanged, img2_possibly_resized).
+        """
+        h1, w1 = img1.shape[:2]
+        h2, w2 = img2.shape[:2]
+
+        if h1 != h2 or w1 != w2:
+            logger.warning(
+                "Spatial dimension mismatch: T1=(%d,%d), T2=(%d,%d). "
+                "Resizing T2 to match T1.",
+                h1, w1, h2, w2,
+            )
+            img2 = cv2.resize(
+                img2, (w1, h1),
+                interpolation=cv2.INTER_LINEAR,
+            )
+
+        return img1, img2
+
+    # ══════════════════════════════════════════════════════════════════
+    #  MODULE 2 — MODEL LOADING & VRAM-SAFE FORWARD PASS
+    # ══════════════════════════════════════════════════════════════════
+
+    # ── Model Loading ────────────────────────────────────────────────
+
+    def _load_model(self) -> None:
+        """Load DINOv2-Large model from local path or HuggingFace identifier.
+
+        Reads num_register_tokens from model.config at runtime (Section 3.1).
+        The model is placed in eval mode and moved to self.device.
+
+        Raises:
+            ImportError: If transformers library is not installed.
+            OSError:     If model_path is invalid or weights are missing.
+        """
+        try:
+            from transformers import Dinov2Model
+        except ImportError as e:
+            raise ImportError(
+                "transformers library required for model loading. "
+                "Install with: pip install transformers"
+            ) from e
+
+        logger.info("Loading DINOv2-Large from: %s", self.model_path)
+        self._model = Dinov2Model.from_pretrained(self.model_path)
+        self._model.eval()
+        self._model.to(self.device)
+
+        # Section 3.1 — read register token count from config, never hardcode
+        self._num_register_tokens = getattr(
+            self._model.config, "num_register_tokens", 0
+        )
+
+        logger.info(
+            "Model loaded — hidden_dim=%d, num_layers=%d, "
+            "patch_size=%d, num_register_tokens=%d, device=%s",
+            self._model.config.hidden_size,
+            self._model.config.num_hidden_layers,
+            self._model.config.patch_size,
+            self._num_register_tokens,
+            self.device,
+        )
+
+    def _ensure_model(self) -> None:
+        """Lazy model loading: load on first use if not already loaded.
+
+        This allows preprocessing methods to work without a model installed,
+        and defers the ~1.2GB VRAM allocation until the first forward pass.
+
+        Raises:
+            ImportError: If transformers library is not installed.
+            OSError:     If model_path is invalid.
+        """
+        if self._model is None:
+            self._load_model()
+
+    # ── VRAM Safety ──────────────────────────────────────────────────
+
+    def _assert_vram(self, label: str) -> float:
+        """Assert that free VRAM exceeds MIN_FREE_VRAM_GB before a forward pass.
+
+        Logs free/allocated/reserved VRAM at DEBUG level for diagnostics.
+
+        Args:
+            label: Human-readable label for log messages (e.g., "Pre-T1").
+
+        Returns:
+            Free VRAM in GB.
+
+        Raises:
+            AssertionError: If free VRAM is below the safety threshold.
+        """
+        if self.device == "cpu":
+            logger.debug("[%s] Running on CPU — VRAM check skipped.", label)
+            return 0.0
+
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        free_gb: float = free_bytes / 1e9
+        allocated_gb: float = torch.cuda.memory_allocated() / 1e9
+        reserved_gb: float = torch.cuda.memory_reserved() / 1e9
+
+        logger.debug(
+            "[%s] VRAM state — free=%.2fGB, allocated=%.2fGB, "
+            "reserved=%.2fGB, total=%.2fGB",
+            label, free_gb, allocated_gb, reserved_gb, total_bytes / 1e9,
+        )
+
+        assert free_gb > MIN_FREE_VRAM_GB, (
+            f"{label} VRAM check failed: {free_gb:.2f}GB free, "
+            f"need >{MIN_FREE_VRAM_GB:.1f}GB"
+        )
+
+        return free_gb
+
+    def _get_peak_vram(self) -> float:
+        """Read peak GPU memory allocated since last reset.
+
+        Returns:
+            Peak VRAM in GB, or 0.0 on CPU.
+        """
+        if self.device == "cpu":
+            return 0.0
+        return torch.cuda.max_memory_allocated() / 1e9
+
+    def _release_gpu(self, label: str) -> None:
+        """Release GPU memory and log the result.
+
+        Calls torch.cuda.empty_cache() and logs the post-release VRAM state.
+
+        Args:
+            label: Human-readable label for log messages.
+        """
+        if self.device == "cpu":
+            return
+        torch.cuda.empty_cache()
+        logger.debug(
+            "[%s] GPU cache cleared — free=%.2fGB",
+            label,
+            torch.cuda.mem_get_info()[0] / 1e9,
+        )
+
+    # ── Register Token Handling (Section 3) ──────────────────────────
+
+    def _strip_cls_and_registers(
+        self, hidden_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """Remove CLS token (index 0) and register tokens from a hidden state.
+
+        Section 3.2: Strip index 0 (CLS) and all register tokens.
+        The register tokens occupy indices 1..num_register_tokens inclusive,
+        immediately after the CLS token.
+
+        Args:
+            hidden_state: Tensor of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            Tensor of shape (batch, n_patches, hidden_dim) with only
+            spatial patch tokens remaining.
+        """
+        n_skip: int = 1 + self._num_register_tokens
+        # PHYSICAL REASON: CLS is a global aggregation token with no spatial
+        # semantics. Register tokens are learned positional anchors that
+        # stabilise attention but carry no image-specific spatial information.
+        return hidden_state[:, n_skip:, :]
+
+    def _validate_patch_grid(
+        self,
+        n_patches: int,
+        raw_shape: tuple[int, ...],
+        n_reg: int,
+    ) -> int:
+        """Assert that the remaining patch count forms a perfect square grid.
+
+        Section 3.3: After stripping CLS + registers, the patch count must
+        be a perfect square (e.g., 1024 = 32x32 for 448x448 input).
+
+        Args:
+            n_patches: Number of patches after token stripping.
+            raw_shape: Original hidden state shape for error reporting.
+            n_reg:     Number of register tokens stripped.
+
+        Returns:
+            Grid side length (int).
+
+        Raises:
+            ConfigurationError: If patch count is not a perfect square.
+        """
+        grid_side: int = int(math.isqrt(n_patches))
+
+        if grid_side * grid_side != n_patches:
+            nearest_sq: int = round(n_patches ** 0.5) ** 2
+            raise ConfigurationError(
+                f"Non-square patch grid detected.\n"
+                f"  Raw hidden state shape : {raw_shape}\n"
+                f"  num_register_tokens    : {n_reg}\n"
+                f"  Remaining seq length   : {n_patches}\n"
+                f"  Nearest perfect square : {nearest_sq}\n"
+                "Check model config or input resolution."
+            )
+
+        logger.debug(
+            "Patch grid validated: %d patches -> %dx%d grid",
+            n_patches, grid_side, grid_side,
+        )
+        return grid_side
+
+    # ── Single-Tile Forward Pass (Section 2.2) ───────────────────────
+
+    def _forward_single(
+        self, tensor: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, ...], float]:
+        """Execute a single VRAM-safe forward pass on one preprocessed tile.
+
+        Implements Section 2.2 Steps A–E (or F–J for T2):
+          A. Assert VRAM > 1.5GB
+          B. Move tensor to GPU
+          C. Forward pass under torch.inference_mode()
+          D. Offload ALL hidden_states to CPU
+          E. Delete GPU tensors, clear cache
+
+        The returned hidden_states tuple contains one tensor per model layer
+        (embedding + N transformer layers), each on CPU.
+
+        Args:
+            tensor: Preprocessed tile tensor, shape (1, 3, H, H) on CPU.
+
+        Returns:
+            Tuple of:
+              - hidden_states: tuple of CPU tensors, one per layer
+              - vram_peak_gb: peak VRAM during this forward pass
+
+        Raises:
+            AssertionError: If free VRAM is below safety threshold.
+        """
+        self._ensure_model()
+
+        # Step A — VRAM pre-flight check
+        self._assert_vram("Pre-forward")
+
+        # Reset peak tracker for this pass
+        if self.device != "cpu":
+            torch.cuda.reset_peak_memory_stats()
+
+        # Step B — Move tensor to device
+        device_tensor: torch.Tensor = tensor.to(self.device)
+
+        # Step C — Forward pass under inference_mode (Section 2.1)
+        # PHYSICAL REASON: inference_mode() over no_grad() eliminates view
+        # tracking, reducing VRAM fragmentation by ~8–12%. On a 6GB device
+        # at ~4.8GB baseline, this margin prevents OOM.
+        with torch.inference_mode():
+            outputs = self._model(
+                pixel_values=device_tensor,
+                output_hidden_states=True,
+            )
+
+        # Step D — Offload ALL hidden_states to CPU immediately
+        features: tuple[torch.Tensor, ...] = tuple(
+            h.detach().cpu() for h in outputs.hidden_states
+        )
+
+        # Record peak VRAM for this pass
+        vram_peak: float = self._get_peak_vram()
+
+        # Step E — Release GPU memory
+        del outputs, device_tensor
+        self._release_gpu("Post-forward")
+
+        logger.debug(
+            "Forward pass complete — %d layers offloaded to CPU, "
+            "peak VRAM=%.2fGB",
+            len(features), vram_peak,
+        )
+
+        return features, vram_peak
+
+    # ── Tiling Infrastructure ────────────────────────────────────────
+
+    def _compute_tiles(
+        self, h: int, w: int,
+    ) -> list[tuple[int, int, int, int]]:
+        """Compute tile coordinates for a sliding-window pass over a large image.
+
+        Tiles are guaranteed to be exactly target_size x target_size. Edge tiles
+        are shifted inward to maintain this size, which may create slight overlap
+        at the image boundary even when tile_overlap=0.
+
+        Args:
+            h: Image height in pixels.
+            w: Image width in pixels.
+
+        Returns:
+            List of (y_start, x_start, y_end, x_end) tuples defining each tile.
+        """
+        tile_sz: int = self.target_size
+        stride: int = tile_sz - self.tile_overlap
+        # PHYSICAL REASON: Overlap allows patch descriptors near tile boundaries
+        # to incorporate full spatial context. Default 0 for non-overlapping
+        # tiling; increase to PATCH_SIZE_PX (14px) or more if boundary artifacts
+        # are observed.
+
+        tiles: list[tuple[int, int, int, int]] = []
+        seen: set[tuple[int, int, int, int]] = set()
+
+        y: int = 0
+        while y < h:
+            y_end: int = min(y + tile_sz, h)
+            y_start: int = max(0, y_end - tile_sz)
+            # PHYSICAL REASON: Clamp ensures every tile is exactly tile_sz
+            # pixels tall. Undersized tiles would produce a different patch
+            # grid geometry, breaking the spatial stitching logic.
+
+            x: int = 0
+            while x < w:
+                x_end: int = min(x + tile_sz, w)
+                x_start: int = max(0, x_end - tile_sz)
+
+                coord: tuple[int, int, int, int] = (y_start, x_start, y_end, x_end)
+                if coord not in seen:
+                    tiles.append(coord)
+                    seen.add(coord)
+
+                if x_end >= w:
+                    break
+                x += stride
+
+            if y_end >= h:
+                break
+            y += stride
+
+        logger.debug(
+            "Tiling plan: %dx%d image -> %d tiles of %dx%d (overlap=%dpx)",
+            h, w, len(tiles), tile_sz, tile_sz, self.tile_overlap,
+        )
+        return tiles
+
+    def _needs_tiling(self, h: int, w: int) -> bool:
+        """Determine whether an image requires tiling.
+
+        Args:
+            h: Image height in pixels.
+            w: Image width in pixels.
+
+        Returns:
+            True if either dimension exceeds target_size.
+        """
+        return h > self.target_size or w > self.target_size
+
+    # ── Full Image Processing (with tiling) ──────────────────────────
+
+    def _process_image(
+        self, img: np.ndarray,
+    ) -> tuple[dict[int, torch.Tensor], float]:
+        """Process a single-timestamp image through the full forward pipeline.
+
+        For images <= 448x448: preprocesses and runs a single forward pass.
+        For images > 448x448: tiles the image, processes each tile sequentially
+        with full GPU->CPU offload between tiles, and stitches the spatial
+        feature grids back together.
+
+        Returns only the layers specified by LAYER_INDICES to conserve memory.
+
+        Args:
+            img: Raw input image (any supported dtype/shape).
+
+        Returns:
+            Tuple of:
+              - layer_features: dict mapping layer_index to a CPU tensor
+                of shape (H_patches, W_patches, hidden_dim) — the spatially
+                arranged patch descriptors for that layer.
+              - vram_peak_gb: maximum peak VRAM across all tile forward passes.
+        """
+        self._ensure_model()
+        h, w = img.shape[:2]
+
+        if not self._needs_tiling(h, w):
+            return self._process_single_tile(img)
+
+        return self._process_tiled(img)
+
+    def _process_single_tile(
+        self, img: np.ndarray,
+    ) -> tuple[dict[int, torch.Tensor], float]:
+        """Process a single image that fits within one tile.
+
+        Args:
+            img: Raw input image <= target_size in both dimensions.
+
+        Returns:
+            (layer_features_dict, vram_peak_gb)
+        """
+        tensor: torch.Tensor = self.preprocess(img)
+        hidden_states, vram_peak = self._forward_single(tensor)
+
+        # Extract and spatially reshape only the layers we need
+        layer_features: dict[int, torch.Tensor] = {}
+        for layer_idx in LAYER_INDICES:
+            hs: torch.Tensor = hidden_states[layer_idx]  # (1, seq_len, dim)
+            patches: torch.Tensor = self._strip_cls_and_registers(hs)
+            n_patches: int = patches.shape[1]
+            grid_side: int = self._validate_patch_grid(
+                n_patches, tuple(hs.shape), self._num_register_tokens,
+            )
+            # Reshape flat sequence -> spatial grid
+            spatial: torch.Tensor = patches[0].reshape(
+                grid_side, grid_side, -1
+            )  # (H_p, W_p, dim)
+            layer_features[layer_idx] = spatial
+
+        # Free all hidden states except what we've extracted
+        del hidden_states
+
+        return layer_features, vram_peak
+
+    def _process_tiled(
+        self, img: np.ndarray,
+    ) -> tuple[dict[int, torch.Tensor], float]:
+        """Process a large image via sequential tiling.
+
+        Each tile is processed independently through the full forward pipeline
+        with strict GPU->CPU offload between tiles. The spatial feature grids
+        are stitched into a full-image feature map per layer.
+
+        For overlapping tiles, features in the overlap region are averaged.
+
+        Args:
+            img: Raw input image > target_size in at least one dimension.
+
+        Returns:
+            (layer_features_dict, vram_peak_gb)
+        """
+        h, w = img.shape[:2]
+        tiles: list[tuple[int, int, int, int]] = self._compute_tiles(h, w)
+        patches_per_side: int = PATCHES_PER_TILE_SIDE
+        # PHYSICAL REASON: Each 448px tile produces a 32x32 patch grid.
+
+        # Compute full patch grid dimensions from outermost tile extents
+        max_y: int = max(t[2] for t in tiles)
+        max_x: int = max(t[3] for t in tiles)
+        full_h_patches: int = max_y // PATCH_SIZE_PX
+        full_w_patches: int = max_x // PATCH_SIZE_PX
+
+        logger.info(
+            "Tiled processing: %d tiles -> full patch grid %dx%d",
+            len(tiles), full_h_patches, full_w_patches,
+        )
+
+        # Accumulators for averaging overlapping regions
+        accum: dict[int, torch.Tensor] = {
+            idx: torch.zeros(
+                full_h_patches, full_w_patches, DINO_HIDDEN_DIM,
+                dtype=torch.float32,
+            )
+            for idx in LAYER_INDICES
+        }
+        counts: torch.Tensor = torch.zeros(
+            full_h_patches, full_w_patches, dtype=torch.float32,
+        )
+
+        vram_peak_max: float = 0.0
+
+        for tile_num, (y_start, x_start, y_end, x_end) in enumerate(tiles):
+            logger.debug(
+                "Processing tile %d/%d: rows[%d:%d], cols[%d:%d]",
+                tile_num + 1, len(tiles), y_start, y_end, x_start, x_end,
+            )
+
+            # Crop tile from the full image
+            tile_img: np.ndarray = img[y_start:y_end, x_start:x_end]
+
+            # Full pipeline: preprocess -> forward -> extract
+            tile_tensor: torch.Tensor = self.preprocess(tile_img)
+            hidden_states, vram_peak = self._forward_single(tile_tensor)
+            vram_peak_max = max(vram_peak_max, vram_peak)
+
+            # Compute patch-grid coordinates for this tile
+            py_start: int = y_start // PATCH_SIZE_PX
+            px_start: int = x_start // PATCH_SIZE_PX
+
+            # Extract layers and place into the full grid
+            for layer_idx in LAYER_INDICES:
+                hs: torch.Tensor = hidden_states[layer_idx]
+                patches: torch.Tensor = self._strip_cls_and_registers(hs)
+                n_patches: int = patches.shape[1]
+                grid_side: int = self._validate_patch_grid(
+                    n_patches, tuple(hs.shape), self._num_register_tokens,
+                )
+                spatial: torch.Tensor = patches[0].reshape(
+                    grid_side, grid_side, -1
+                )
+
+                # Accumulate into full grid (handles overlap via averaging)
+                accum[layer_idx][
+                    py_start:py_start + grid_side,
+                    px_start:px_start + grid_side,
+                    :,
+                ] += spatial
+
+            counts[
+                py_start:py_start + patches_per_side,
+                px_start:px_start + patches_per_side,
+            ] += 1.0
+
+            # Free this tile's hidden states before processing the next tile
+            del hidden_states, tile_tensor
+
+        # Average overlapping regions
+        # PHYSICAL REASON: Where tiles overlap, averaging patch descriptors
+        # produces smoother transitions than hard boundaries, reducing
+        # tile-edge artifacts in the downstream similarity map.
+        counts = counts.clamp(min=1.0)  # guard against division by zero
+        layer_features: dict[int, torch.Tensor] = {}
+        for layer_idx in LAYER_INDICES:
+            accum[layer_idx] /= counts.unsqueeze(-1)
+            layer_features[layer_idx] = accum[layer_idx]
+
+        logger.info(
+            "Tiled processing complete — %d tiles, peak VRAM=%.2fGB, "
+            "output grid=%dx%d",
+            len(tiles), vram_peak_max, full_h_patches, full_w_patches,
+        )
+
+        return layer_features, vram_peak_max
+
+    # ══════════════════════════════════════════════════════════════════
+    #  MODULE 3 — MULTI-SCALE FEATURE EXTRACTION & FUSION
+    # ══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _fuse_features(
+        layer_features: dict[int, torch.Tensor],
+    ) -> torch.Tensor:
+        """Concatenate multi-scale per-layer descriptors into a single map.
+
+        Takes the per-layer spatial feature grids from _process_image() and
+        concatenates them along the channel axis in LAYER_INDICES order,
+        producing the final fused descriptor map for change detection.
+
+        Section 4: Concatenate layers 8, 16, 24 along channel axis.
+          Layer  8 → 1024-dim (edges, texture, silhouette geometry)
+          Layer 16 → 1024-dim (structural parts, object boundaries)
+          Layer 24 → 1024-dim (semantic identity, object-class membership)
+          Fused    → 3072-dim (texture + structure + semantics)
+
+        All operations run on CPU tensors (Section 2.2 Step L).
+
+        Args:
+            layer_features: dict mapping layer index to a CPU tensor of shape
+                            (H_p, W_p, hidden_dim=1024).
+
+        Returns:
+            Fused descriptor map of shape (H_p, W_p, 3072) on CPU, float32.
+
+        Raises:
+            KeyError: If a required layer index is missing from the dict.
+            ValueError: If layer spatial dimensions do not match.
+        """
+        # Validate all required layers are present
+        for idx in LAYER_INDICES:
+            if idx not in layer_features:
+                raise KeyError(
+                    f"Layer {idx} missing from layer_features dict. "
+                    f"Available keys: {list(layer_features.keys())}"
+                )
+
+        # Collect tensors in canonical layer order
+        tensors: list[torch.Tensor] = [
+            layer_features[idx] for idx in LAYER_INDICES
+        ]
+
+        # Validate spatial dimensions match across all layers
+        ref_h, ref_w = tensors[0].shape[0], tensors[0].shape[1]
+        for i, (idx, t) in enumerate(zip(LAYER_INDICES, tensors)):
+            if t.shape[0] != ref_h or t.shape[1] != ref_w:
+                raise ValueError(
+                    f"Spatial dimension mismatch: layer {LAYER_INDICES[0]} "
+                    f"is ({ref_h}, {ref_w}) but layer {idx} is "
+                    f"({t.shape[0]}, {t.shape[1]}). All layers must share "
+                    "the same patch grid geometry."
+                )
+
+        # Concatenate along channel axis: 3 × 1024 → 3072
+        # PHYSICAL REASON: Concatenating all three scales makes cosine
+        # similarity sensitive to simultaneous structural AND semantic change.
+        # A patch must agree on texture, shape, AND semantic class to be
+        # considered "unchanged."
+        fused: torch.Tensor = torch.cat(tensors, dim=-1)
+
+        expected_channels: int = DINO_HIDDEN_DIM * len(LAYER_INDICES)
+        # 1024 * 3 = 3072
+        logger.debug(
+            "Feature fusion: %d layers × %d-dim → %d-dim descriptor, "
+            "grid=%dx%d, device=%s",
+            len(LAYER_INDICES),
+            DINO_HIDDEN_DIM,
+            fused.shape[-1],
+            fused.shape[0],
+            fused.shape[1],
+            fused.device,
+        )
+
+        assert fused.shape[-1] == expected_channels, (
+            f"Fused channel dim {fused.shape[-1]} != expected {expected_channels}"
+        )
+
+        return fused
+
+    def _extract_fused_features(
+        self, img: np.ndarray,
+    ) -> tuple[torch.Tensor, float]:
+        """Full pipeline: raw image → fused 3072-dim spatial descriptor map.
+
+        Chains Module 1 (preprocess) → Module 2 (forward + extract) →
+        Module 3 (fuse) into a single call. Handles both single-tile and
+        tiled images transparently.
+
+        All returned tensors are on CPU (Section 2.2 Step L).
+
+        Args:
+            img: Raw input image (any supported dtype/shape).
+
+        Returns:
+            Tuple of:
+              - fused_features: CPU tensor (H_p, W_p, 3072) float32 —
+                the spatially arranged, multi-scale patch descriptors.
+              - vram_peak_gb: peak VRAM across all forward passes.
+        """
+        # Module 2: forward pass(es) → per-layer spatial features
+        layer_features, vram_peak = self._process_image(img)
+
+        # Module 3: fuse layers into 3072-dim descriptors
+        fused: torch.Tensor = self._fuse_features(layer_features)
+
+        # Free per-layer dict — fused tensor holds all the information
+        del layer_features
+
+        logger.debug(
+            "Fused features extracted: shape=%s, dtype=%s, "
+            "peak VRAM=%.2fGB",
+            tuple(fused.shape), fused.dtype, vram_peak,
+        )
+
+        return fused, vram_peak
+
+    # ══════════════════════════════════════════════════════════════════
+    #  MODULE 4 — CHANGE DETECTION LOGIC & CHANGERESULT ASSEMBLY
+    # ══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _cosine_similarity_map(
+        features_t1: torch.Tensor,
+        features_t2: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute per-patch cosine similarity between two fused descriptor maps.
+
+        Section 5.1: L2-normalise all 3072-dim descriptors before dot product
+        for numerical stability, then compute patch-level cosine similarity.
+
+        Args:
+            features_t1: (H_p, W_p, 3072) fused descriptor map for T1.
+            features_t2: (H_p, W_p, 3072) fused descriptor map for T2.
+
+        Returns:
+            Similarity map of shape (H_p, W_p), float32, values in [-1, 1].
+            Values near 1.0 indicate high similarity (no change);
+            values near 0.0 or negative indicate strong change.
+        """
+        # PHYSICAL REASON for L2 normalisation before dot product:
+        # The raw 3072-dim descriptors vary by ~2 orders of magnitude in norm
+        # depending on patch content (textured patches carry larger activations
+        # than flat sky/water). Without normalisation, the dot product would
+        # be dominated by patch magnitude rather than directional agreement,
+        # biasing the similarity metric toward textured regions.
+        norm_t1: torch.Tensor = F.normalize(features_t1, p=2, dim=-1)
+        norm_t2: torch.Tensor = F.normalize(features_t2, p=2, dim=-1)
+
+        # Per-patch dot product across the channel dimension
+        similarity: torch.Tensor = (norm_t1 * norm_t2).sum(dim=-1)
+        # Shape: (H_p, W_p), dtype: float32
+
+        logger.debug(
+            "Cosine similarity map: shape=%s, min=%.4f, max=%.4f, mean=%.4f",
+            tuple(similarity.shape),
+            similarity.min().item(),
+            similarity.max().item(),
+            similarity.mean().item(),
+        )
+
+        return similarity
+
+    @staticmethod
+    def _pool_similarity(similarity_map: torch.Tensor) -> torch.Tensor:
+        """Apply neighbourhood consensus max-pooling on the similarity map.
+
+        Section 5.2: Max-pool on SIMILARITY (not change map) with kernel=3,
+        stride=1, padding=1. Pooling on similarity propagates "unchanged"
+        evidence from adjacent patches, suppressing false positives from
+        ±1-patch displacement due to orthorectification residuals or
+        relief-induced parallax.
+
+        Args:
+            similarity_map: (H_p, W_p) cosine similarity map.
+
+        Returns:
+            Pooled similarity map of same shape. Each value is the MAX
+            similarity within a 3×3 neighbourhood centred on that patch.
+        """
+        # PHYSICAL REASON for pooling similarity, not change_map:
+        # Max-pool on similarity propagates "unchanged" evidence outward,
+        # meaning a patch is considered unchanged if ANY neighbour in a 3×3
+        # window matches well. This suppresses false positives from small
+        # (±1 patch) spatial misalignment. Pooling on the change map would
+        # instead spread the change signal — the opposite of what we want.
+
+        # Add batch + channel dims for F.max_pool2d: (1, 1, H, W)
+        sim_4d: torch.Tensor = similarity_map.unsqueeze(0).unsqueeze(0)
+
+        pooled_4d: torch.Tensor = F.max_pool2d(
+            sim_4d,
+            kernel_size=CONSENSUS_KERNEL,  # 3
+            stride=1,
+            padding=1,  # PHYSICAL REASON: padding=1 preserves spatial dims
+        )
+
+        pooled: torch.Tensor = pooled_4d.squeeze(0).squeeze(0)
+        # Shape: (H_p, W_p), same as input
+
+        logger.debug(
+            "Pooled similarity (kernel=%d): min=%.4f, max=%.4f, mean=%.4f",
+            CONSENSUS_KERNEL,
+            pooled.min().item(),
+            pooled.max().item(),
+            pooled.mean().item(),
+        )
+
+        return pooled
+
+    @staticmethod
+    def _zscore_threshold(
+        change_map: torch.Tensor,
+        threshold_sigma: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute z-score map and binary mask from a raw change map.
+
+        Section 5.3: Dynamic z-score anchors detection to the tail of each
+        pair's own change distribution, making the detector invariant to
+        inter-acquisition radiometric drift (solar elevation, haze, season).
+
+        Special case: when the change_map has effectively zero variance
+        (identical or near-identical images), the z-score would amplify
+        pure floating-point noise into spurious detections. We detect this
+        condition and return an all-False mask in that case.
+
+        Args:
+            change_map:      (H_p, W_p) float32 change intensity map.
+            threshold_sigma: Number of standard deviations above the mean
+                             required to flag a patch as "changed."
+
+        Returns:
+            Tuple of:
+              - z_map:       (H_p, W_p) float32 — per-patch z-scores.
+              - binary_mask: (H_p, W_p) bool    — patches exceeding threshold.
+        """
+        mean: float = float(change_map.mean().item())
+        std: float = float(change_map.std().item())
+
+        # PHYSICAL REASON for the variance guard (NO_CHANGE_STD_FLOOR):
+        # When T1 and T2 are identical or near-identical, change_map has
+        # near-zero variance (~1e-7 from floating-point accumulation noise).
+        # The z-score = (noise - 0) / (1e-7 + eps) amplifies that noise into
+        # values spanning ±several sigma, causing ~3% of patches to spuriously
+        # exceed any reasonable threshold. We floor the std below a physically
+        # meaningful scale: for a change signal measured on [0, 2], a std
+        # below 1e-4 indicates no real change signal is present, and the
+        # binary mask should be all False.
+        NO_CHANGE_STD_FLOOR: float = 1e-4
+
+        # PHYSICAL REASON for Z_SCORE_EPS:
+        # Guards the denominator against exact zero for tensor arithmetic.
+        z_map: torch.Tensor = (change_map - mean) / (std + Z_SCORE_EPS)
+
+        if std < NO_CHANGE_STD_FLOOR:
+            # Effectively zero change signal → no patches flagged
+            binary_mask: torch.Tensor = torch.zeros_like(
+                change_map, dtype=torch.bool,
+            )
+            logger.debug(
+                "Z-score threshold: std=%.2e below no-change floor %.0e → "
+                "all patches unflagged (identical / near-identical images)",
+                std, NO_CHANGE_STD_FLOOR,
+            )
+        else:
+            binary_mask = z_map > threshold_sigma
+            logger.debug(
+                "Z-score threshold: mean=%.4f, std=%.4f, sigma=%.2f, "
+                "flagged=%d/%d patches (%.2f%%)",
+                mean, std, threshold_sigma,
+                int(binary_mask.sum().item()),
+                int(binary_mask.numel()),
+                100.0 * float(binary_mask.float().mean().item()),
+            )
+
+        return z_map, binary_mask
+
+    @staticmethod
+    def _apply_border_exclusion(
+        change_map: np.ndarray,
+        z_map: np.ndarray,
+        binary_mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Zero the outermost BORDER_EXCLUSION_PX rows/columns of each map.
+
+        Section 5.4: Projection distortion and bicubic resampling at image
+        boundaries produce persistent edge-band artifacts that consistently
+        score as high-change. These are orthorectification ghosts, not real
+        events — excluding them prevents the detector from crying wolf on
+        every image edge.
+
+        Args:
+            change_map:  (H_p, W_p) float32.
+            z_map:       (H_p, W_p) float32.
+            binary_mask: (H_p, W_p) bool.
+
+        Returns:
+            Tuple of (change_map, z_map, binary_mask) with borders zeroed.
+            Numpy arrays returned directly (not tensors) for ChangeResult.
+        """
+        b: int = BORDER_EXCLUSION_PX
+
+        # PHYSICAL REASON for in-place zeroing on copies:
+        # The slices overlap at corners (the b×b corner regions are zeroed
+        # by both row and column passes), but since we're writing 0.0 /
+        # False, the overlap is idempotent — no double-counting concerns.
+
+        # Zero top/bottom rows
+        change_map[:b, :] = 0.0
+        change_map[-b:, :] = 0.0
+        z_map[:b, :] = 0.0
+        z_map[-b:, :] = 0.0
+        binary_mask[:b, :] = False
+        binary_mask[-b:, :] = False
+
+        # Zero left/right columns
+        change_map[:, :b] = 0.0
+        change_map[:, -b:] = 0.0
+        z_map[:, :b] = 0.0
+        z_map[:, -b:] = 0.0
+        binary_mask[:, :b] = False
+        binary_mask[:, -b:] = False
+
+        logger.debug(
+            "Border exclusion applied: %dpx zeroed on all edges",
+            BORDER_EXCLUSION_PX,
+        )
+
+        return change_map, z_map, binary_mask
+
+    def compare(self, img1: np.ndarray, img2: np.ndarray) -> ChangeResult:
+        """Compare two temporal images and compute patch-level change detection.
+
+        Full pipeline (Sections 5.1–5.4):
+          1. Spatial alignment (resize T2 to T1 if needed)
+          2. Extract fused 3072-dim descriptors for T1 (sequential GPU pass)
+          3. Extract fused 3072-dim descriptors for T2 (sequential GPU pass)
+          4. Per-patch cosine similarity (L2-normalised dot product)
+          5. 3×3 max-pool on SIMILARITY (neighbourhood consensus)
+          6. Change map = 1.0 - pooled_similarity
+          7. Z-score threshold for binary mask
+          8. Border exclusion (3 patches on all edges)
+
+        The two forward passes run sequentially with full GPU→CPU offload
+        between them, enforcing the 6GB VRAM budget.
+
+        Args:
+            img1: T1 image (reference). Any supported dtype/shape.
+            img2: T2 image (target). Will be resized to T1 dimensions if needed.
+
+        Returns:
+            ChangeResult dataclass with all detection outputs.
+
+        Raises:
+            TypeError:  If input dtype is not uint8 or uint16.
+            ValueError: If input shape is not supported.
+        """
+        logger.info("compare() called — T1 shape=%s, T2 shape=%s",
+                    img1.shape, img2.shape)
+
+        # ── Step 1: Spatial alignment ──
+        img1, img2 = self._align_spatial(img1, img2)
+
+        # ── Step 2: Fused features for T1 (sequential, GPU→CPU) ──
+        logger.info("Extracting T1 features...")
+        features_t1, vram_t1 = self._extract_fused_features(img1)
+
+        # ── Step 3: Fused features for T2 (sequential, GPU→CPU) ──
+        # Section 2.2 mandates T1 is fully on CPU + cache cleared before T2.
+        # _extract_fused_features() guarantees both via _forward_single().
+        logger.info("Extracting T2 features...")
+        features_t2, vram_t2 = self._extract_fused_features(img2)
+
+        # Section 2.2 Step K — peak VRAM across both passes
+        vram_peak_gb: float = max(vram_t1, vram_t2)
+
+        # ── Step 4: Per-patch cosine similarity (raw, pre-pool) ──
+        # Section 5.1: L2-normalise, then dot product
+        similarity_raw: torch.Tensor = self._cosine_similarity_map(
+            features_t1, features_t2,
+        )
+
+        # Capture pre-pool global mean for ChangeResult
+        mean_similarity: float = float(similarity_raw.mean().item())
+
+        # Free fused features — no longer needed
+        del features_t1, features_t2
+
+        # ── Step 5: Max-pool on SIMILARITY (Section 5.2) ──
+        # PHYSICAL REASON: pooling similarity propagates "unchanged" evidence;
+        # pooling on change_map would do the opposite and spread false positives.
+        similarity_pooled: torch.Tensor = self._pool_similarity(similarity_raw)
+
+        # ── Step 6: Change map = 1.0 - pooled_similarity ──
+        change_map_tensor: torch.Tensor = 1.0 - similarity_pooled
+        # PHYSICAL REASON: Cosine similarity ∈ [-1, 1] with 1.0 = identical.
+        # Inverting via (1 - sim) produces change intensity ∈ [0, 2], with
+        # 0.0 = perfectly unchanged and larger values = more change.
+
+        # ── Step 7: Dynamic z-score threshold (Section 5.3) ──
+        z_map_tensor, binary_mask_tensor = self._zscore_threshold(
+            change_map_tensor, self.threshold_sigma,
+        )
+
+        # ── Step 8: Convert to numpy and apply border exclusion ──
+        change_map_np: np.ndarray = change_map_tensor.numpy().astype(np.float32)
+        z_map_np: np.ndarray = z_map_tensor.numpy().astype(np.float32)
+        binary_mask_np: np.ndarray = binary_mask_tensor.numpy().astype(bool)
+
+        change_map_np, z_map_np, binary_mask_np = self._apply_border_exclusion(
+            change_map_np, z_map_np, binary_mask_np,
+        )
+
+        # ── Step 9: Compute change_ratio (post border exclusion) ──
+        # PHYSICAL REASON: Ratio is computed over ALL patches in the mask
+        # (including border zeros) so that border exclusion correctly
+        # reduces the reported change fraction — the borders are definitively
+        # unchanged by our policy.
+        change_ratio: float = float(binary_mask_np.mean())
+
+        # ── Step 10: Assemble ChangeResult ──
+        result: ChangeResult = ChangeResult(
+            change_map=change_map_np,
+            binary_mask=binary_mask_np,
+            z_map=z_map_np,
+            change_ratio=change_ratio,
+            mean_similarity=mean_similarity,
+            vram_peak_gb=vram_peak_gb,
+        )
+
+        logger.info(
+            "compare() complete — change_ratio=%.2f%%, mean_similarity=%.4f, "
+            "vram_peak=%.2fGB, grid=%dx%d",
+            change_ratio * 100.0,
+            mean_similarity,
+            vram_peak_gb,
+            change_map_np.shape[0],
+            change_map_np.shape[1],
+        )
+
+        return result
+
+    # ── Stub method for Module 5 ────────────────────────────────────
+
+    def visualize(
+        self,
+        img1: np.ndarray,
+        img2: np.ndarray,
+        result: ChangeResult,
+        t1_label: str = "T1",
+        t2_label: str = "T2",
+    ) -> np.ndarray:
+        """Produce three-panel visualisation of change detection results.
+
+        [Module 5 — not yet implemented]
+
+        Args:
+            img1:     T1 image.
+            img2:     T2 image.
+            result:   ChangeResult from compare().
+            t1_label: Label for T1 panel.
+            t2_label: Label for T2 panel.
+
+        Returns:
+            uint8 RGB numpy array of the composite visualisation.
+
+        Raises:
+            NotImplementedError: Until Module 5 is integrated.
+        """
+        raise NotImplementedError(
+            "visualize() requires Module 5 implementation."
+        )
