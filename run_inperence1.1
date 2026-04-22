@@ -1,0 +1,156 @@
+"""
+run_inference.py — Real-World Satellite Change Detection
+=========================================================
+
+Runs the DinoV3ChangeDetector on actual satellite imagery using
+the DINOv2-Large backbone (facebook/dinov2-large).
+
+T1: see T1_PATH below
+T2: see T2_PATH below
+Out: see OUTPUT_PATH below
+
+Author : CV Engineering
+Python : 3.12+
+
+C:\cv_output\before_bw.png
+"""
+
+import logging
+import sys
+import time
+
+import cv2
+import numpy as np
+
+# ── Logging ──────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(levelname)-7s │ %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("inference")
+
+# ── Paths ────────────────────────────────────────────────────────────
+T1_PATH = r"C:\cv_output\after_bw.png"
+T2_PATH = r"C:\cv_output\after_bw.png"
+OUTPUT_PATH = r"C:\cv_output\change_detection_result.png"
+
+# ── Model config ─────────────────────────────────────────────────────
+# Using DINOv2-Large (patch_size=14, hidden_dim=1024, 24 layers)
+# This matches the current dino_change_detector.py implementation.
+MODEL_ID = "facebook/dinov2-large"
+
+
+def main() -> int:
+    import torch
+    from dino_change_detector import DinoV3ChangeDetector, ChangeResult
+
+    log.info("=" * 60)
+    log.info("  Satellite Change Detection — Real Imagery")
+    log.info("=" * 60)
+
+    # ── Step 1: Device selection ─────────────────────────────────
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        log.info("  GPU: %s (%.1f GB VRAM)", gpu_name, vram_total)
+    else:
+        log.info("  Running on CPU — inference will be slower")
+    log.info("  Device: %s", device)
+
+    # ── Step 2: Load images ──────────────────────────────────────
+    log.info("  Loading T1: %s", T1_PATH)
+    img_t1: np.ndarray = cv2.imread(T1_PATH, cv2.IMREAD_UNCHANGED)
+    if img_t1 is None:
+        log.error("  FAILED to load T1 image. Check path exists.")
+        return 1
+
+    log.info("  Loading T2: %s", T2_PATH)
+    img_t2: np.ndarray = cv2.imread(T2_PATH, cv2.IMREAD_UNCHANGED)
+    if img_t2 is None:
+        log.error("  FAILED to load T2 image. Check path exists.")
+        return 1
+
+    log.info("  T1: shape=%s, dtype=%s", img_t1.shape, img_t1.dtype)
+    log.info("  T2: shape=%s, dtype=%s", img_t2.shape, img_t2.dtype)
+
+    # ── Step 3: Initialise detector ──────────────────────────────
+    log.info("-" * 60)
+    log.info("  Initialising DinoV3ChangeDetector...")
+    log.info("  Model: %s", MODEL_ID)
+
+    detector = DinoV3ChangeDetector(
+        model_path=MODEL_ID,
+        device=device,
+        threshold_sigma=2.0,
+    )
+
+    # ── Step 4: Run change detection ─────────────────────────────
+    log.info("-" * 60)
+    log.info("  Running compare() — this will download the model on first run...")
+    t_start: float = time.perf_counter()
+
+    result: ChangeResult = detector.compare(img_t1, img_t2)
+
+    t_elapsed: float = time.perf_counter() - t_start
+
+    # ── Step 5: Print results ────────────────────────────────────
+    log.info("=" * 60)
+    log.info("  RESULTS")
+    log.info("  ─────────────────────────────────────")
+    log.info("  Change Ratio   : %.2f%%", result.change_ratio * 100)
+    log.info("  Mean Similarity: %.4f", result.mean_similarity)
+    log.info("  Peak VRAM      : %.2f GB", result.vram_peak_gb)
+    log.info("  Patch Grid     : %dx%d", result.change_map.shape[0],
+             result.change_map.shape[1])
+    log.info("  Inference Time : %.1f seconds", t_elapsed)
+    log.info("  ─────────────────────────────────────")
+
+    # ── Step 6: Generate and save visualisation ──────────────────
+    log.info("  Generating heatmap visualisation...")
+    vis: np.ndarray = detector.visualize(
+        img_t1, img_t2, result,
+        t1_label="Before",
+        t2_label="After",
+    )
+
+    # Downscale if the composite is very large (>8000px wide)
+    # to avoid cv2.imwrite failures on massive PNG files
+    MAX_WIDTH: int = 6000
+    h_vis, w_vis = vis.shape[:2]
+    if w_vis > MAX_WIDTH:
+        scale_factor: float = MAX_WIDTH / w_vis
+        new_w: int = MAX_WIDTH
+        new_h: int = int(h_vis * scale_factor)
+        vis = cv2.resize(vis, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        log.info("  Downscaled composite: %dx%d → %dx%d (%.0f%%)",
+                 w_vis, h_vis, new_w, new_h, scale_factor * 100)
+
+    # visualize() returns RGB; cv2.imwrite expects BGR
+    vis_bgr: np.ndarray = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+
+    # Save as JPG (more reliable for large images) + PNG
+    jpg_path: str = OUTPUT_PATH.replace(".png", ".jpg")
+    ok_jpg: bool = cv2.imwrite(jpg_path, vis_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    ok_png: bool = cv2.imwrite(OUTPUT_PATH, vis_bgr)
+
+    if ok_jpg:
+        log.info("  Saved JPG: %s", jpg_path)
+    else:
+        log.error("  FAILED to save JPG!")
+
+    if ok_png:
+        log.info("  Saved PNG: %s", OUTPUT_PATH)
+    else:
+        log.warning("  PNG save failed — JPG should still be available")
+
+    log.info("  Final composite shape: %s", vis.shape)
+
+    log.info("=" * 60)
+    log.info("  Done.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
